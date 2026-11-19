@@ -534,3 +534,126 @@ async def test_managed_browser_cold_retry_and_idle_restart(fake_chrome: FakeChro
     finally:
         await runtime.stop()
     assert actions == ["start", "stop"] * 3
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_managed_browser_retries_failed_idle_stop(fake_chrome: FakeChrome, monkeypatch):
+    actions = []
+    retry_started = asyncio.Event()
+    finish_retry = asyncio.Event()
+
+    async def systemctl(*command):
+        assert command[:2] == ("systemctl", "--user")
+        assert command[3:] == ("--", "chrome.service")
+        action = command[2]
+        actions.append(action)
+        attempt = actions.count("stop")
+
+        class Process:
+            async def wait(self):
+                if action == "stop":
+                    if attempt == 1:
+                        return 1
+                    retry_started.set()
+                    await finish_retry.wait()
+                return 0
+
+        return Process()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", systemctl)
+    runtime = CdpBrowserRuntime(fake_chrome.endpoint, capacity=1, systemd_unit="chrome.service", idle_seconds=0.02)
+    await runtime.start()
+    try:
+        await runtime.fetch("https://example.com", user_agent="test", timeout_seconds=3)
+        await asyncio.wait_for(retry_started.wait(), timeout=2)
+        assert actions == ["start", "stop", "stop"]
+        assert runtime.snapshot()["last_failure"] == "RuntimeError"
+    finally:
+        finish_retry.set()
+        await runtime.stop()
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_drain_finishes_managed_fetch_waiting_for_idle_stop(fake_chrome: FakeChrome, monkeypatch):
+    stop_started = asyncio.Event()
+    finish_stop = asyncio.Event()
+
+    async def systemctl(*command):
+        action = command[2]
+
+        class Process:
+            async def wait(self):
+                if action == "stop":
+                    stop_started.set()
+                    await finish_stop.wait()
+                return 0
+
+        return Process()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", systemctl)
+    runtime = CdpBrowserRuntime(fake_chrome.endpoint, capacity=1, systemd_unit="chrome.service", idle_seconds=0.01)
+    await runtime.start()
+
+    async def render():
+        return await runtime.fetch("https://example.com", user_agent="test", timeout_seconds=3)
+
+    try:
+        await render()
+        await asyncio.wait_for(stop_started.wait(), timeout=2)
+        async with asyncio.TaskGroup() as tasks:
+            queued_render = tasks.create_task(render())
+            await asyncio.sleep(0)
+            assert runtime.snapshot()["active"] == 1
+            drained = tasks.create_task(runtime.drain(3))
+            await asyncio.sleep(0)
+            assert runtime.snapshot()["state"] == "draining"
+            finish_stop.set()
+        assert queued_render.result().status_code == 200
+        assert drained.result()
+    finally:
+        finish_stop.set()
+        await runtime.stop()
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_cancelled_managed_start_reaps_command_and_stops_unit(fake_chrome: FakeChrome, monkeypatch):
+    actions = []
+    starting = asyncio.Event()
+    killed = asyncio.Event()
+
+    async def systemctl(*command):
+        action = command[2]
+        actions.append(action)
+
+        class Process:
+            returncode = None
+
+            async def wait(self):
+                if action == "start":
+                    starting.set()
+                    await killed.wait()
+                return 0
+
+            def kill(self):
+                killed.set()
+                raise ProcessLookupError
+
+        return Process()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", systemctl)
+    runtime = CdpBrowserRuntime(fake_chrome.endpoint, capacity=1, systemd_unit="chrome.service")
+    await runtime.start()
+    try:
+        render = asyncio.create_task(runtime.fetch("https://example.com", user_agent="test", timeout_seconds=3))
+        await asyncio.wait_for(starting.wait(), timeout=2)
+        render.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await render
+        assert actions == ["start", "stop"]
+        assert killed.is_set()
+        assert runtime.snapshot()["active"] == 0
+    finally:
+        await runtime.stop()

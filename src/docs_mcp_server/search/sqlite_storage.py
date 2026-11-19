@@ -569,8 +569,10 @@ class SqliteSegmentStore:
             schema_data = metadata.get("schema", "{}")
             try:
                 schema = Schema.from_dict(json.loads(schema_data))
+                doc_count = int(metadata.get("doc_count", 0) or 0)
+                body_total_terms = int(metadata.get("body_total_terms", 0) or 0)
             except (json.JSONDecodeError, ValueError, KeyError, TypeError):
-                # Handle missing or corrupted schema
+                # Handle missing or corrupted segment metadata.
                 return None
 
             created_at_str = metadata.get("created_at", datetime.now(timezone.utc).isoformat())
@@ -579,15 +581,13 @@ class SqliteSegmentStore:
             except ValueError:
                 created_at = datetime.now(timezone.utc)
 
-            doc_count = int(metadata.get("doc_count", 0) or 0)
-
             return SqliteSegment(
                 schema=schema,
                 db_path=db_path,
                 segment_id=segment_id,
                 created_at=created_at,
                 doc_count=doc_count,
-                body_total_terms=int(metadata.get("body_total_terms", 0) or 0),
+                body_total_terms=body_total_terms,
             )
         except sqlite3.Error:
             return None

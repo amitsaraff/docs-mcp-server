@@ -439,22 +439,30 @@ def test_sqlite_storage_save_handles_close_failure(sample_schema, sample_documen
         captured["conn"].close()
 
 
-def test_sqlite_storage_update_manifest_handles_bad_json_and_write_error(sample_schema, monkeypatch, tmp_path):
-    """Cover manifest error handling branches."""
-    sqlite_store = SqliteSegmentStore(tmp_path)
-    manifest_path = sqlite_store._manifest_path
-    manifest_path.write_text("{bad json", encoding="utf-8")
+def test_failed_atomic_manifest_replacement_preserves_published_segment(sample_schema, monkeypatch, tmp_path):
+    store = SqliteSegmentStore(tmp_path)
+    writer = SqliteSegmentWriter(sample_schema, segment_id="old")
+    store.save(writer.build())
+    manifest = tmp_path / "manifest.json"
+    previous = manifest.read_bytes()
+    writer.segment_id = "next"
 
-    original_write = Path.write_text
+    def fail_replace(_source, target):
+        assert target == manifest
+        raise OSError("manifest replace failed")
 
-    def _write_text(path, *args, **kwargs):
-        if path == manifest_path:
-            raise OSError("write boom")
-        return original_write(path, *args, **kwargs)
+    with monkeypatch.context() as patcher:
+        patcher.setattr(Path, "replace", fail_replace)
+        with pytest.raises(OSError, match="manifest replace failed"):
+            store.save(writer.build())
 
-    monkeypatch.setattr(Path, "write_text", _write_text)
-
-    sqlite_store._update_manifest("seg1", {"doc_count": 0})
+    assert manifest.read_bytes() == previous
+    assert not any(path.is_dir() for path in tmp_path.iterdir())
+    store.prune_to_segment_ids([])
+    assert (tmp_path / "old.db").is_file()
+    assert not (tmp_path / "next.db").exists()
+    store.save(writer.build())
+    assert b'"latest_segment_id": "next"' in manifest.read_bytes()
 
 
 def test_sqlite_storage_load_returns_none_when_metadata_missing(monkeypatch, tmp_path):
@@ -925,3 +933,17 @@ def test_sqlite_storage_concurrent_access(sample_schema, sample_documents):
         # All threads should have successfully loaded the segment
         assert all(results)
         assert len(results) == 3
+
+
+def test_segment_load_rejects_invalid_corpus_statistics(sample_schema, tmp_path):
+    store = SqliteSegmentStore(tmp_path)
+    writer = SqliteSegmentWriter(sample_schema, segment_id="published")
+    path = store.save(writer.build())
+    conn = sqlite3.connect(path)
+    try:
+        conn.execute("UPDATE metadata SET value = 'invalid' WHERE key = 'body_total_terms'")
+        conn.commit()
+    finally:
+        conn.close()
+
+    assert store.load("published") is None

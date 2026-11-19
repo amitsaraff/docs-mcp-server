@@ -445,3 +445,27 @@ print("pruned", flush=True)
     with app._lease_search_index() as reader:
         assert reader.search("zebra").results[0].document_title == "New"
         assert reader.get_document_by_url("https://example.com/old") is None
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_invalid_manifest_keeps_last_valid_search_and_missing_db_reports_unready(tmp_path: Path):
+    tenant = _make_filesystem_config(tmp_path)
+    directory = Path(tenant.docs_root_dir) / "__search_segments"
+    store = SqliteSegmentStore(directory)
+    writer = SqliteSegmentWriter(create_default_schema(), segment_id="current")
+    writer.add_document({"url": "https://example.com/guide", "title": "Zebra guide", "body": "Running zebras"})
+    published = store.save(writer.build())
+    manifest = directory / "manifest.json"
+    previous = manifest.read_text()
+    app = TenantApp(tenant)
+    assert app.get_index_status()["segment_ready"]
+
+    manifest.write_text("[]")
+    assert not app.get_index_status()["segment_ready"]
+    result = await app.search("zebra", 10, False)
+    assert result.results[0].title == "Zebra guide"
+
+    manifest.write_text(previous)
+    published.unlink()
+    assert not app.get_index_status()["segment_ready"]

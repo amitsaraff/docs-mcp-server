@@ -122,7 +122,7 @@ class TenantApp:
                 logger.debug("Failed to read manifest for %s: %s", self.codename, exc)
             return None
 
-        latest_segment_id = manifest.get("latest_segment_id")
+        latest_segment_id = manifest.get("latest_segment_id") if isinstance(manifest, dict) else None
         if not isinstance(latest_segment_id, str) or not latest_segment_id.strip():
             if log_missing:
                 logger.warning("No latest segment ID for %s", self.codename)
@@ -511,7 +511,9 @@ class TenantApp:
             **self.get_performance_stats(),
             "current_segment_id": current_segment_id,
             "latest_segment_id": latest_segment_id,
-            "segment_ready": segment is not None and current_segment_id == latest_segment_id,
+            "segment_ready": segment is not None
+            and current_segment_id == latest_segment_id
+            and segment.db_path.is_file(),
             "doc_count": segment.doc_count if segment else 0,
             "last_indexed_at": segment.created_at.isoformat() if segment else None,
         }

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncIterator, Mapping
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
 import json
 import logging
@@ -218,14 +218,18 @@ class CdpBrowserRuntime:
         async with self._connection_lock:
             # Acquiring a lease cancels this task until the stop has begun.
             self._idle_task = None
-            self._state = "idle"
             try:
                 await self._disconnect()
             except Exception as exc:
                 self._record_failure(exc)
-                if self._state == "idle":
+                if self._state != "draining":
                     self._state = "disconnected"
+                    if self._unit_started and not self._active:
+                        self._idle_task = asyncio.create_task(self._stop_when_idle(), name="cdp-browser-idle-stop")
                 logger.exception("Failed to stop idle Chrome")
+            else:
+                if self._state != "draining":
+                    self._state = "idle"
 
     async def _systemctl(self, action: str) -> None:
         process = await asyncio.create_subprocess_exec(
@@ -239,7 +243,8 @@ class CdpBrowserRuntime:
             status = await process.wait()
         except asyncio.CancelledError:
             if process.returncode is None:
-                process.kill()
+                with suppress(ProcessLookupError):
+                    process.kill()
             await process.wait()
             raise
         if status:
@@ -260,8 +265,6 @@ class CdpBrowserRuntime:
             if self._http is None:
                 raise RuntimeError("Browser runtime has not been started")
 
-            if self._state in {"draining", "stopped"}:
-                raise RuntimeError(f"Browser runtime cannot connect while {self._state}")
             try:
                 if self._systemd_unit and not self._unit_started:
                     self._unit_started = True
@@ -383,7 +386,7 @@ class CdpBrowserRuntime:
         except Exception as exc:  # pragma: no cover - aiohttp transport boundary
             failure = exc
         finally:
-            intentional_close = self._state in {"idle", "draining", "stopped"}
+            intentional_close = self._websocket is not websocket or self._state in {"draining", "stopped"}
             if not intentional_close:
                 self._record_failure(failure)
             for command_id, pending in list(self._pending.items()):
