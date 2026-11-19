@@ -16,16 +16,18 @@ def apply_read_pragmas(
     mmap_size_bytes: int = 134217728,
     temp_store: str = "FILE",
     query_only: bool = True,
+    configure_journal: bool = True,
     threads: int | None = None,
     busy_timeout_ms: int | None = 30000,
 ) -> None:
     """Apply read-optimized PRAGMAs with optional overrides."""
     if busy_timeout_ms is not None:
         conn.execute(f"PRAGMA busy_timeout = {busy_timeout_ms}")
-    conn.execute("PRAGMA journal_mode = WAL")
-    conn.execute("PRAGMA synchronous = NORMAL")
-    conn.execute(f"PRAGMA wal_autocheckpoint = {WAL_AUTOCHECKPOINT_PAGES}")
-    conn.execute(f"PRAGMA journal_size_limit = {JOURNAL_SIZE_LIMIT_BYTES}")
+    if configure_journal:
+        conn.execute("PRAGMA journal_mode = WAL")
+        conn.execute("PRAGMA synchronous = NORMAL")
+        conn.execute(f"PRAGMA wal_autocheckpoint = {WAL_AUTOCHECKPOINT_PAGES}")
+        conn.execute(f"PRAGMA journal_size_limit = {JOURNAL_SIZE_LIMIT_BYTES}")
     conn.execute(f"PRAGMA cache_size = {cache_size_kb}")
     conn.execute(f"PRAGMA mmap_size = {mmap_size_bytes}")
     conn.execute(f"PRAGMA temp_store = {temp_store}")

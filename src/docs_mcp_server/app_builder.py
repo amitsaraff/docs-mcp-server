@@ -128,6 +128,7 @@ class AppBuilder:
             self.browser_runtime = CdpBrowserRuntime(
                 infra.browser_cdp_endpoint,
                 infra.sync_concurrency_limit,
+                systemd_unit=os.getenv("DOCS_MCP_BROWSER_SYSTEMD_UNIT"),
             )
 
         self._initialize_tenants()

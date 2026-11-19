@@ -265,18 +265,19 @@ def test_sqlite_storage_prune_segments(sample_schema, sample_documents):
             (Path(f"{db_path}-wal")).write_text("wal")
             (Path(f"{db_path}-shm")).write_text("shm")
 
-        # Keep only first two segments
+        # Keep the first two segments and preserve the published generation
         keep_ids = segment_ids[:2]
         sqlite_store.prune_to_segment_ids(keep_ids)
 
         # Verify only kept segments remain
+        keep_ids.append(segment_ids[-1])
         remaining_segments = sqlite_store.list_segments()
         remaining_ids = {seg["segment_id"] for seg in remaining_segments}
         assert remaining_ids == set(keep_ids)
         for segment_id in keep_ids:
             assert (Path(temp_dir) / f"{segment_id}.db-wal").exists()
             assert (Path(temp_dir) / f"{segment_id}.db-shm").exists()
-        for segment_id in segment_ids[2:]:
+        for segment_id in set(segment_ids) - set(keep_ids):
             assert not (Path(temp_dir) / f"{segment_id}.db-wal").exists()
             assert not (Path(temp_dir) / f"{segment_id}.db-shm").exists()
 
@@ -431,8 +432,10 @@ def test_sqlite_storage_save_handles_close_failure(sample_schema, sample_documen
 
         monkeypatch.setattr(sqlite3, "connect", _connect)
 
-        db_path = sqlite_store.save(segment_data)
-        assert db_path.exists()
+        with pytest.raises(RuntimeError, match="close boom"):
+            sqlite_store.save(segment_data)
+        assert not sqlite_store._db_path("close_fail").exists()
+        assert not sqlite_store._manifest_path.exists()
         captured["conn"].close()
 
 
@@ -533,8 +536,8 @@ def test_sqlite_storage_load_handles_close_error(sample_schema, sample_documents
                 else:
                     setattr(self._conn, name, value)
 
-        def _connect(path):
-            conn = real_connect(path)
+        def _connect(path, **kwargs):
+            conn = real_connect(path, **kwargs)
             captured["conn"] = conn
             return _ConnWrapper(conn)
 
@@ -609,6 +612,9 @@ def test_sqlite_storage_prune_ignores_unlink_errors(sample_schema, sample_docume
         writer.add_document(sample_documents[0])
         sqlite_store.save(writer.build())
 
+        writer.segment_id = "current"
+        sqlite_store.save(writer.build())
+
         target_path = sqlite_store._db_path("to_remove")
         original_unlink = Path.unlink
 
@@ -619,7 +625,9 @@ def test_sqlite_storage_prune_ignores_unlink_errors(sample_schema, sample_docume
 
         monkeypatch.setattr(Path, "unlink", _unlink)
 
-        sqlite_store.prune_to_segment_ids([])
+        removed, errors = sqlite_store.prune_to_segment_ids([])
+        assert not removed
+        assert errors == ["failed to remove to_remove.db: unlink boom"]
 
 
 def test_sqlite_segment_writer_adds_unique_field_when_not_stored():

@@ -4,6 +4,9 @@ Works with the existing segment database format that has documents and postings 
 Provides BM25 scoring and snippet generation with optional SIMD optimization.
 """
 
+from contextlib import contextmanager
+from copy import copy
+from dataclasses import replace
 import logging
 import math
 from pathlib import Path
@@ -56,11 +59,13 @@ class SegmentSearchIndex:
         enable_simd: bool | None = None,
         enable_lockfree: bool | None = None,
         enable_bloom_filter: bool | None = None,
+        segment: SqliteSegment | None = None,
     ):
         """Initialize search index with segment database."""
         self.db_path = db_path
         self.tenant = tenant
         self._conn = None
+        self.segment = segment
         self._avg_doc_length_fallback = 1000.0
 
         # SIMD optimization (enabled by default for performance)
@@ -78,7 +83,7 @@ class SegmentSearchIndex:
 
         # Lock-free concurrency (enabled by default for performance)
         if enable_lockfree is None:
-            enable_lockfree = True  # Default to enabled for maximum performance
+            enable_lockfree = segment is None
 
         self._lockfree_enabled = enable_lockfree and LOCKFREE_AVAILABLE
         if self._lockfree_enabled:
@@ -96,8 +101,19 @@ class SegmentSearchIndex:
         if self._bloom_enabled:
             logger.info("SQLite-resident bloom filter enabled for query term filtering")
 
-        # Initialize connection and prepared statements
-        self._initialize_connection()
+        self._prepare_statements()
+        if segment is None:
+            self._initialize_connection()
+
+    @contextmanager
+    def reader(self):
+        """Use one lazily opened connection for scoring and lookups."""
+        reader = copy(self)
+        reader.segment = replace(self.segment, _pool=None)
+        try:
+            yield reader
+        finally:
+            reader.segment.close()
 
     def __enter__(self):
         """Context manager entry."""
@@ -117,11 +133,11 @@ class SegmentSearchIndex:
         )
         apply_read_pragmas(self._conn)
 
-        # Prepare frequently used statements for better performance
-        self._prepare_statements()
-
     def _execute_query(self, query: str, params: tuple = ()) -> list:
         """Execute query using lock-free concurrency when available."""
+        if self.segment is not None:
+            with self.segment._pool.get_connection() as conn:
+                return conn.execute(query, params).fetchall()
         if self._lockfree_enabled:
             return self._concurrent_search.execute_concurrent_query(query, params)
         cursor = self._conn.execute(query, params)
@@ -129,8 +145,8 @@ class SegmentSearchIndex:
 
     def _execute_single_query(self, query: str, params: tuple = ()) -> tuple | None:
         """Execute query returning single result using lock-free concurrency when available."""
-        if self._lockfree_enabled:
-            results = self._concurrent_search.execute_concurrent_query(query, params)
+        if self.segment is not None or self._lockfree_enabled:
+            results = self._execute_query(query, params)
             return results[0] if results else None
         cursor = self._conn.execute(query, params)
         return cursor.fetchone()
@@ -154,7 +170,8 @@ class SegmentSearchIndex:
                 try:
                     response = self._search_with_engine(segment, query, max_results)
                 finally:
-                    segment.close()
+                    if self.segment is None:
+                        segment.close()
                 span.set_attribute("search.result_count", len(response.results))
                 return response
 
@@ -243,8 +260,7 @@ class SegmentSearchIndex:
         return SearchResponse(results=results)
 
     def _load_segment_for_scoring(self) -> SqliteSegment | None:
-        store = SqliteSegmentStore(self.db_path.parent)
-        return store.load(self.db_path.stem)
+        return self.segment or SqliteSegmentStore(self.db_path.parent).load(self.db_path.stem)
 
     def _prepare_statements(self):
         """Prepare frequently used SQL statements for better performance."""
@@ -414,12 +430,16 @@ class SegmentSearchIndex:
 
     def _get_corpus_stats(self) -> tuple[int, float]:
         """Get total docs and average body length from metadata."""
-        rows = self._execute_query("SELECT key, value FROM metadata WHERE key IN ('doc_count', 'body_total_terms')")
-        metadata = {row[0]: row[1] for row in rows}
-        if "doc_count" not in metadata or "body_total_terms" not in metadata:
-            raise RuntimeError("Segment metadata missing doc_count/body_total_terms; reindex required")
-        total_docs = int(metadata["doc_count"] or 0)
-        total_terms = int(metadata["body_total_terms"] or 0)
+        if self.segment is not None:
+            total_docs = self.segment.doc_count
+            total_terms = self.segment.body_total_terms
+        else:
+            rows = self._execute_query("SELECT key, value FROM metadata WHERE key IN ('doc_count', 'body_total_terms')")
+            metadata = dict(rows)
+            if "doc_count" not in metadata or "body_total_terms" not in metadata:
+                raise RuntimeError("Segment metadata missing doc_count/body_total_terms; reindex required")
+            total_docs = int(metadata["doc_count"] or 0)
+            total_terms = int(metadata["body_total_terms"] or 0)
         if total_docs <= 0:
             return 0, self._avg_doc_length_fallback
         avg_length = total_terms / total_docs

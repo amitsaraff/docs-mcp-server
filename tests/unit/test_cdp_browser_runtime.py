@@ -220,6 +220,7 @@ async def test_fetch_owns_only_exact_disposable_resources(fake_chrome: FakeChrom
         "endpoint": fake_chrome.endpoint,
         "state": "ready",
         "ready": True,
+        "healthy": True,
         "active": 0,
         "capacity": 2,
         "acquired": 1,
@@ -486,3 +487,50 @@ async def test_cancelled_fetch_returns_resources(fake_chrome: FakeChrome):
     assert fake_chrome.contexts == set()
     assert runtime.snapshot()["active"] == 0
     await runtime.stop()
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_managed_browser_cold_retry_and_idle_restart(fake_chrome: FakeChrome, monkeypatch):
+    runtime = CdpBrowserRuntime(fake_chrome.endpoint, capacity=2, systemd_unit="chrome.service", idle_seconds=0.02)
+    actions = []
+    stopped = asyncio.Event()
+
+    async def systemctl(action):
+        actions.append(action)
+        if action == "stop":
+            stopped.set()
+
+    monkeypatch.setattr(runtime, "_systemctl", systemctl)
+    await runtime.start()
+    assert runtime.snapshot()["healthy"]
+    assert actions == []
+    assert fake_chrome.version_requests == 0
+
+    async def render():
+        return await runtime.fetch("https://example.com", user_agent="test", timeout_seconds=3)
+
+    try:
+        fake_chrome.protocol_version = "2.0"
+        with pytest.raises(RuntimeError, match="protocol version"):
+            await render()
+        assert actions == ["start", "stop"]
+        assert not runtime.snapshot()["healthy"]
+
+        stopped.clear()
+        fake_chrome.protocol_version = "1.3"
+        fake_chrome.evaluate_delay = 0.06
+        first, second = await asyncio.gather(render(), render())
+        assert first.html == second.html
+        assert actions == ["start", "stop", "start"]
+        await render()  # Arrives before expiry and takes longer than the idle window.
+        assert actions == ["start", "stop", "start"]
+        await asyncio.wait_for(stopped.wait(), timeout=2)
+        assert actions == ["start", "stop", "start", "stop"]
+        assert runtime.snapshot()["state"] == "idle"
+        assert runtime.snapshot()["healthy"]
+        await render()
+        assert actions[-1] == "start"
+    finally:
+        await runtime.stop()
+    assert actions == ["start", "stop"] * 3

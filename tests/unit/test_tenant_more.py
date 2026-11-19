@@ -2,9 +2,13 @@
 
 from __future__ import annotations
 
+from contextlib import suppress
 import json
 from pathlib import Path
+import select
 import sqlite3
+import subprocess
+import sys
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -12,6 +16,7 @@ import pytest
 
 from docs_mcp_server.deployment_config import ArticleExtractorFallbackConfig, SharedInfraConfig, TenantConfig
 from docs_mcp_server.search.schema import create_default_schema
+from docs_mcp_server.search.sqlite_storage import SqliteSegmentStore, SqliteSegmentWriter
 from docs_mcp_server.service_layer.filesystem_unit_of_work import FileSystemUnitOfWork
 from docs_mcp_server.services.git_sync_scheduler_service import GitSyncSchedulerService
 from docs_mcp_server.tenant import (
@@ -156,35 +161,6 @@ def test_reload_search_index_keeps_old_on_failure(tmp_path: Path):
 
 
 @pytest.mark.unit
-def test_reload_search_index_closes_old_on_success(tmp_path: Path, caplog):
-    """Test warning logged when old index close fails."""
-    tenant = _make_filesystem_config(tmp_path)
-    app = TenantApp(tenant)
-
-    class MockIndex:
-        db_path = Path("old.db")
-
-        def close(self):
-            raise RuntimeError("close failed")
-
-    app._search_index = MockIndex()
-
-    docs_root = Path(tenant.docs_root_dir)
-    segments_dir = docs_root / "__search_segments"
-    segments_dir.mkdir()
-    manifest = segments_dir / "manifest.json"
-    manifest.write_text('{"latest_segment_id": "test123"}')
-    db_file = segments_dir / "test123.db"
-    _write_minimal_segment_db(db_file)
-
-    result = app.reload_search_index()
-
-    assert result is True
-    assert "Failed to close search index" in caplog.text
-    app._close_search_indexes()
-
-
-@pytest.mark.unit
 def test_manifest_reload_updates_search_index(tmp_path: Path):
     tenant = _make_filesystem_config(tmp_path)
     docs_root = Path(tenant.docs_root_dir)
@@ -203,7 +179,7 @@ def test_manifest_reload_updates_search_index(tmp_path: Path):
     _write_minimal_segment_db(segment_two)
     manifest.write_text('{"latest_segment_id": "seg2"}')
 
-    updated = app._maybe_reload_from_manifest(log_missing=False)
+    updated = app.reload_search_index(log_missing=False)
 
     assert updated is True
     assert app._current_segment_id() == "seg2"
@@ -228,7 +204,7 @@ def test_manifest_reload_skips_unready_segment(tmp_path: Path):
     (segments_dir / "seg2.db").touch()
     manifest.write_text('{"latest_segment_id": "seg2"}')
 
-    updated = app._maybe_reload_from_manifest(log_missing=False)
+    updated = app.reload_search_index(log_missing=False)
 
     assert updated is False
     assert app._current_segment_id() == "seg1"
@@ -418,3 +394,54 @@ def test_build_scheduler_service_returns_uow_factory(tmp_path: Path):
 
     uow = service.uow_factory()
     assert isinstance(uow, FileSystemUnitOfWork)
+
+
+@pytest.mark.unit
+def test_reader_survives_cross_process_publish_and_releases_on_error(tmp_path: Path):
+    tenant = _make_filesystem_config(tmp_path)
+    store = SqliteSegmentStore(Path(tenant.docs_root_dir) / "__search_segments")
+    writer = SqliteSegmentWriter(create_default_schema(), segment_id="old")
+    writer.add_document({"url": "https://example.com/old", "title": "Old", "body": "old zebra"})
+    old = store.save(writer.build())
+    app = TenantApp(tenant)
+    worker_code = """
+import sys
+from docs_mcp_server.search.schema import create_default_schema
+from docs_mcp_server.search.sqlite_storage import SqliteSegmentStore, SqliteSegmentWriter
+store = SqliteSegmentStore(sys.argv[1])
+writer = SqliteSegmentWriter(create_default_schema(), segment_id="new")
+writer.add_document({"url": "https://example.com/new", "title": "New", "body": "new zebra"})
+store.save(writer.build())
+print("published", flush=True)
+store.prune_to_segment_ids(["new"])
+print("pruned", flush=True)
+"""
+    with subprocess.Popen(
+        [sys.executable, "-c", worker_code, str(store.directory)],
+        stdout=subprocess.PIPE,
+        text=True,
+    ) as worker:
+        try:
+            with pytest.raises(ValueError, match="interrupted"):  # noqa: PT012 - exercise cleanup across the lease
+                with app._lease_search_index() as reader:
+                    assert reader.search("zebra").results[0].document_title == "Old"
+                    assert select.select([worker.stdout], [], [], 5)[0]
+                    assert worker.stdout.readline().strip() == "published"
+                    assert not select.select([worker.stdout], [], [], 0.05)[0]
+                    assert old.exists()
+                    assert reader.get_document_by_url("https://example.com/old")["title"] == "Old"
+                    raise ValueError("interrupted")
+            if Path("/proc/self/fd").is_dir():
+                for fd in Path("/proc/self/fd").iterdir():
+                    with suppress(FileNotFoundError):
+                        assert str(store.directory) not in str(fd.readlink())
+                assert str(store.directory) not in Path("/proc/self/maps").read_text()
+            assert worker.communicate(timeout=5)[0] == "pruned\n"
+            assert worker.returncode == 0
+        finally:
+            if worker.poll() is None:
+                worker.kill()
+    assert not old.exists()
+    with app._lease_search_index() as reader:
+        assert reader.search("zebra").results[0].document_title == "New"
+        assert reader.get_document_by_url("https://example.com/old") is None

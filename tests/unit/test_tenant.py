@@ -197,7 +197,7 @@ class TestTenantApp:
         await app.shutdown()
 
     @pytest.mark.asyncio
-    async def test_shutdown_closes_search_index(self, tenant_config):
+    async def test_shutdown_discards_search_metadata(self, tenant_config):
         """Test that shutdown closes the search index."""
         app = TenantApp(tenant_config)
 
@@ -206,7 +206,7 @@ class TestTenantApp:
         app._search_index = mock_index
 
         await app.shutdown()
-        mock_index.close.assert_called_once()
+        assert app._search_index is None
 
     @pytest.mark.asyncio
     async def test_shutdown_without_search_index(self, tenant_config):
@@ -271,54 +271,6 @@ class TestTenantApp:
         assert result.results == []
         assert result.error is not None
         assert "No search index available" in result.error
-
-    @pytest.mark.asyncio
-    async def test_search_with_index_success(self, tenant_config):
-        """Test successful search with search index."""
-        app = TenantApp(tenant_config)
-
-        # Mock search index and response
-        mock_index = Mock()
-        mock_search_response = Mock()
-        mock_search_response.results = [
-            Mock(
-                document_url="http://example.com/doc1",
-                document_title="Test Document",
-                relevance_score=0.95,
-                snippet="Test snippet",
-            )
-        ]
-        mock_index.search.return_value = mock_search_response
-        app._search_index = mock_index
-
-        result = await app.search("test query", 10, False)
-
-        assert isinstance(result, SearchDocsResponse)
-        assert len(result.results) == 1
-        assert result.results[0].url == "http://example.com/doc1"
-        assert result.results[0].title == "Test Document"
-        assert result.results[0].snippet == "Test snippet"
-        assert result.error is None
-
-        mock_index.search.assert_called_once_with("test query", 10)
-
-    @pytest.mark.asyncio
-    async def test_search_with_index_exception(self, tenant_config):
-        """Test search when index raises exception."""
-        app = TenantApp(tenant_config)
-
-        # Mock search index that raises exception
-        mock_index = Mock()
-        mock_index.search.side_effect = Exception("Search failed")
-        app._search_index = mock_index
-
-        result = await app.search("test query", 10, False)
-
-        assert isinstance(result, SearchDocsResponse)
-        assert result.results == []
-        assert result.error is not None
-        assert "Search failed" in result.error
-        assert result.query == "test query"
 
     @pytest.mark.asyncio
     async def test_fetch_returns_error_for_uncached_url(self, tenant_config):

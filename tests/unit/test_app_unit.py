@@ -228,17 +228,18 @@ def test_browser_capacity_uses_sync_concurrency_limit(
     config_path = tmp_path / "deployment.json"
     config_path.write_text(json.dumps(standard_config), encoding="utf-8")
     events: list[tuple[str, str]] = []
-    runtime_arguments: list[tuple[str, int]] = []
+    runtime_arguments: list[tuple[str, int, str | None]] = []
+    monkeypatch.setenv("DOCS_MCP_BROWSER_SYSTEMD_UNIT", "chrome.service")
     _install_minimal_stubs(monkeypatch, events)
 
-    def build_runtime(endpoint: str, capacity: int) -> FakeBrowserRuntime:
-        runtime_arguments.append((endpoint, capacity))
+    def build_runtime(endpoint: str, capacity: int, *, systemd_unit: str | None) -> FakeBrowserRuntime:
+        runtime_arguments.append((endpoint, capacity, systemd_unit))
         return FakeBrowserRuntime(events)
 
     monkeypatch.setattr("docs_mcp_server.app_builder.CdpBrowserRuntime", build_runtime)
 
     assert create_app(config_path) is not None
-    assert runtime_arguments == [("http://127.0.0.1:9222", 7)]
+    assert runtime_arguments == [("http://127.0.0.1:9222", 7, "chrome.service")]
 
 
 @pytest.mark.unit

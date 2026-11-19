@@ -12,13 +12,18 @@ from __future__ import annotations
 
 from array import array
 from collections import defaultdict
-from contextlib import contextmanager
+from collections.abc import Iterable
+from contextlib import closing, contextmanager, suppress
 from dataclasses import dataclass
 from datetime import datetime, timezone
+import fcntl
+from itertools import chain
 import json
 import logging
+import os
 from pathlib import Path
 import sqlite3
+from tempfile import TemporaryDirectory
 import threading
 from typing import Any
 from uuid import uuid4
@@ -106,9 +111,10 @@ def _validate_bloom_block_bits() -> None:
 class SQLiteConnectionPool:
     """Thread-safe connection pool with thread-local connections."""
 
-    def __init__(self, db_path: Path, max_connections: int = 5):
+    def __init__(self, db_path: Path, max_connections: int = 5, *, read_only: bool = False):
         self.db_path = db_path
         self.max_connections = max_connections
+        self.read_only = read_only
         self._local = threading.local()
 
     @contextmanager
@@ -121,8 +127,13 @@ class SQLiteConnectionPool:
 
     def _create_connection(self) -> sqlite3.Connection:
         """Create connection with optimal performance settings."""
-        conn = sqlite3.connect(self.db_path, check_same_thread=False, cached_statements=0)
-        apply_read_pragmas(conn)
+        path = f"{self.db_path.resolve().as_uri()}?mode=ro" if self.read_only else self.db_path
+        conn = sqlite3.connect(path, uri=self.read_only, check_same_thread=False, cached_statements=0)
+        try:
+            apply_read_pragmas(conn, configure_journal=not self.read_only)
+        except BaseException:
+            conn.close()
+            raise
         return conn
 
     def close_all(self) -> None:
@@ -145,11 +156,12 @@ class SqliteSegment:
     created_at: datetime
     doc_count: int
     _pool: SQLiteConnectionPool | None = None
+    body_total_terms: int = 0
 
     def __post_init__(self):
         """Initialize connection pool lazily."""
         if self._pool is None:
-            object.__setattr__(self, "_pool", SQLiteConnectionPool(self.db_path))
+            object.__setattr__(self, "_pool", SQLiteConnectionPool(self.db_path, read_only=True))
 
     def get_postings(
         self,
@@ -276,43 +288,41 @@ class SqliteSegmentStore:
         segment_id = segment_data.get("segment_id") or segment_data.get("i") or uuid4().hex
         db_path = self._db_path(segment_id)
 
-        # If segment already exists, don't overwrite it
-        if db_path.exists():
-            # Just update manifest and return existing path
+        with self.generation_lock():
+            if not db_path.exists():
+                # Stage outside the prune glob and publish only a complete DB.
+                with TemporaryDirectory(dir=self.directory) as staging:
+                    staged_db = Path(staging) / db_path.name
+                    self._write_segment(staged_db, segment_id, segment_data)
+                    with suppress(FileExistsError):
+                        db_path.hardlink_to(staged_db)
             self._update_manifest(segment_id, segment_data)
-            return db_path
-
-        conn = None
-        try:
-            conn = sqlite3.connect(db_path, cached_statements=0)
-            self._apply_optimizations(conn)
-            self._create_schema(conn)
-            self._store_metadata(conn, segment_id, segment_data)
-            self._store_postings(conn, segment_data)
-            self._store_bloom_filter(conn, segment_data)
-            self._store_documents(conn, segment_data)
-            conn.execute("PRAGMA optimize")  # Update query planner stats efficiently
-            conn.commit()
-            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")  # Keep WAL size bounded after writes
-        except sqlite3.Error as e:
-            # Clean up partial file on error
-            if db_path.exists():
-                try:
-                    db_path.unlink()
-                except OSError as cleanup_error:
-                    logger.warning("Failed to remove partial SQLite segment file %s: %s", db_path, cleanup_error)
-            raise RuntimeError(f"Failed to save SQLite segment: {e}") from e
-        finally:
-            if conn:
-                try:
-                    conn.close()
-                except sqlite3.Error as close_error:
-                    logger.warning("Failed to close SQLite connection for %s: %s", db_path, close_error)
-
-        # Update manifest to point to latest segment
-        self._update_manifest(segment_id, segment_data)
-
         return db_path
+
+    @contextmanager
+    def generation_lock(self, *, exclusive: bool = False):
+        """Protect published files from pruning across processes."""
+        fd = os.open(self.directory, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH)
+            yield
+        finally:
+            os.close(fd)
+
+    def _write_segment(self, db_path: Path, segment_id: str, segment_data: dict[str, Any]) -> None:
+        try:
+            with closing(sqlite3.connect(db_path, cached_statements=0)) as conn:
+                self._apply_optimizations(conn)
+                self._create_schema(conn)
+                self._store_metadata(conn, segment_id, segment_data)
+                self._store_postings(conn, segment_data)
+                self._store_bloom_filter(conn, segment_data)
+                self._store_documents(conn, segment_data)
+                conn.execute("PRAGMA optimize")
+                conn.commit()
+                conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        except sqlite3.Error as exc:
+            raise RuntimeError(f"Failed to save SQLite segment: {exc}") from exc
 
     def _update_manifest(self, segment_id: str, segment_data: dict[str, Any]) -> None:
         """Update manifest.json to point to the latest segment."""
@@ -331,7 +341,7 @@ class SqliteSegmentStore:
         doc_count = 0
         if db_path.exists():
             try:
-                with sqlite3.connect(db_path) as conn:
+                with closing(sqlite3.connect(f"{db_path.resolve().as_uri()}?mode=ro", uri=True)) as conn:
                     doc_count = conn.execute("SELECT COUNT(*) FROM documents").fetchone()[0]
             except sqlite3.Error:
                 doc_count = segment_data.get("doc_count", 0)
@@ -344,11 +354,10 @@ class SqliteSegmentStore:
         provenance = segment_data.get("provenance")
         if isinstance(provenance, dict):
             manifest_data["provenance"] = provenance
-        try:
-            self._manifest_path.write_text(json.dumps(manifest_data), encoding="utf-8")
-        except OSError as e:
-            # Non-fatal error - segment is still saved
-            logger.warning("Failed to update manifest: %s", e)
+        with TemporaryDirectory(dir=self.directory) as staging:
+            manifest = Path(staging) / self.MANIFEST_FILENAME
+            manifest.write_text(json.dumps(manifest_data), encoding="utf-8")
+            manifest.replace(self._manifest_path)
 
     def _apply_optimizations(self, conn: sqlite3.Connection) -> None:
         """Apply SQLite performance optimizations."""
@@ -550,7 +559,7 @@ class SqliteSegmentStore:
 
         conn = None
         try:
-            conn = sqlite3.connect(db_path)
+            conn = sqlite3.connect(f"{db_path.resolve().as_uri()}?mode=ro", uri=True)
             conn.row_factory = sqlite3.Row
             metadata = self._load_metadata(conn)
 
@@ -573,7 +582,12 @@ class SqliteSegmentStore:
             doc_count = int(metadata.get("doc_count", 0) or 0)
 
             return SqliteSegment(
-                schema=schema, db_path=db_path, segment_id=segment_id, created_at=created_at, doc_count=doc_count
+                schema=schema,
+                db_path=db_path,
+                segment_id=segment_id,
+                created_at=created_at,
+                doc_count=doc_count,
+                body_total_terms=int(metadata.get("body_total_terms", 0) or 0),
             )
         except sqlite3.Error:
             return None
@@ -637,27 +651,34 @@ class SqliteSegmentStore:
                 continue
         return segments
 
-    def prune_to_segment_ids(self, keep_segment_ids: list[str]) -> None:
-        """Remove segments not in keep list."""
-        keep_set = set(keep_segment_ids)
-        for db_file in self.directory.glob(f"*{self.DB_SUFFIX}"):
-            if db_file.stem not in keep_set:
+    def prune_to_segment_ids(
+        self, keep_segment_ids: Iterable[str], *, dry_run: bool = False
+    ) -> tuple[list[tuple[Path, int]], list[str]]:
+        """Remove obsolete DBs and sidecars while protecting the published generation."""
+        removed: list[tuple[Path, int]] = []
+        errors: list[str] = []
+        with self.generation_lock(exclusive=True):
+            keep_set = set(keep_segment_ids)
+            with suppress(FileNotFoundError):
+                manifest = json.loads(self._manifest_path.read_text(encoding="utf-8"))
+                keep_set.add(manifest["latest_segment_id"])
+            for path in chain(self.directory.glob(f"*{self.DB_SUFFIX}"), self.directory.glob(f"*{self.DB_SUFFIX}-*")):
+                segment_id = (
+                    path.stem if path.suffix == self.DB_SUFFIX else path.name.rsplit(f"{self.DB_SUFFIX}-", 1)[0]
+                )
+                if segment_id in keep_set:
+                    continue
                 try:
-                    db_file.unlink()
-                except OSError:
-                    pass  # Ignore errors during cleanup
-                for sidecar in db_file.parent.glob(f"{db_file.name}-*"):
-                    try:
-                        sidecar.unlink()
-                    except OSError:
-                        pass  # Ignore errors during cleanup
-        for sidecar in self.directory.glob(f"*{self.DB_SUFFIX}-*"):
-            base_name = sidecar.name.split(f"{self.DB_SUFFIX}-", 1)[0]
-            if base_name not in keep_set:
-                try:
-                    sidecar.unlink()
-                except OSError:
-                    pass  # Ignore errors during cleanup
+                    size = path.stat().st_size
+                    if not dry_run:
+                        path.unlink()
+                    removed.append((path, size))
+                except OSError as exc:
+                    if path.suffix == self.DB_SUFFIX:
+                        keep_set.add(segment_id)
+                    errors.append(f"failed to remove {path.name}: {exc}")
+                    logger.warning("Failed to prune %s: %s", path, exc)
+        return removed, errors
 
     def _db_path(self, segment_id: str) -> Path:
         """Get database path for segment."""

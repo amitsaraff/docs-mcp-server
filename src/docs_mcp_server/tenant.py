@@ -12,7 +12,6 @@ from contextlib import contextmanager, suppress
 import json
 import logging
 from pathlib import Path
-import threading
 import time
 from typing import Any
 from urllib.parse import unquote, urlparse
@@ -24,7 +23,6 @@ from .search.indexer import INDEXABLE_EXTENSIONS, TenantIndexer
 from .search.indexing_utils import build_indexing_context
 from .search.segment_search_index import SegmentSearchIndex
 from .search.sqlite_storage import SqliteSegmentStore
-from .search.storage_factory import create_segment_store
 from .service_layer.filesystem_unit_of_work import FileSystemUnitOfWork
 from .services.git_sync_scheduler_service import GitSyncSchedulerService
 from .services.scheduler_service import SchedulerService, SchedulerServiceConfig
@@ -62,10 +60,8 @@ class TenantApp:
         self.tenant_config = tenant_config
         self.codename = tenant_config.codename
         self.docs_name = tenant_config.docs_name
-        self._search_lock = threading.Lock()
-        self._active_searches = 0
-        self._retired_indexes: list[SegmentSearchIndex] = []
-        self._search_index = self._create_search_index()
+        self._search_index: SegmentSearchIndex | None = None
+        self.reload_search_index()
         self._manifest_poll_interval = _MANIFEST_POLL_INTERVAL_S
         self._manifest_watch_task: asyncio.Task | None = None
         self._manifest_stop_event = asyncio.Event()
@@ -135,131 +131,39 @@ class TenantApp:
             return None
         return latest_segment_id
 
-    def _segment_ready(self, segments_dir: Path, segment_id: str) -> bool:
-        store = SqliteSegmentStore(segments_dir)
-        segment = store.load(segment_id)
-        if segment is None:
-            return False
-        segment.close()
-        return True
-
     def _current_segment_id(self) -> str | None:
-        with self._search_lock:
-            if self._search_index is None:
-                return None
-            return self._search_index.db_path.stem
-
-    def _close_index(self, index: SegmentSearchIndex) -> None:
-        try:
-            index.close()
-        except Exception as exc:
-            logger.warning("[%s] Failed to close search index: %s", self.codename, exc)
-
-    def _swap_search_index(self, new_index: SegmentSearchIndex) -> None:
-        old_index: SegmentSearchIndex | None = None
-        close_now = False
-        with self._search_lock:
-            old_index = self._search_index
-            self._search_index = new_index
-            if old_index is not None:
-                if self._active_searches > 0:
-                    self._retired_indexes.append(old_index)
-                else:
-                    close_now = True
-        if close_now and old_index is not None:
-            self._close_index(old_index)
+        index = self._search_index
+        return index.db_path.stem if index else None
 
     def _close_search_indexes(self) -> None:
-        current: SegmentSearchIndex | None = None
-        retired: list[SegmentSearchIndex] = []
-        with self._search_lock:
-            current = self._search_index
-            self._search_index = None
-            retired = list(self._retired_indexes)
-            self._retired_indexes = []
-            self._active_searches = 0
-        if current is not None:
-            self._close_index(current)
-        for old in retired:
-            self._close_index(old)
+        self._search_index = None
 
     @contextmanager
     def _lease_search_index(self) -> Iterator[SegmentSearchIndex | None]:
-        index: SegmentSearchIndex | None = None
-        with self._search_lock:
-            index = self._search_index
-            if index is not None:
-                self._active_searches += 1
-        try:
-            yield index
-        finally:
-            if index is not None:
-                retired: list[SegmentSearchIndex] = []
-                with self._search_lock:
-                    self._active_searches -= 1
-                    assert self._active_searches >= 0, "Active searches went negative - lease/release mismatch"
-                    if self._active_searches == 0 and self._retired_indexes:
-                        retired = self._retired_indexes
-                        self._retired_indexes = []
-                for old in retired:
-                    self._close_index(old)
-
-    def _create_search_index(
-        self,
-        *,
-        segment_id: str | None = None,
-        log_missing: bool = True,
-    ) -> SegmentSearchIndex | None:
-        """Create search index directly from segment database."""
-        search_segments_dir = self._segments_dir()
-
-        if not search_segments_dir.exists():
-            if log_missing:
-                logger.warning("No search segments directory for %s", self.codename)
+        segments_dir = self._segments_dir()
+        if not segments_dir.is_dir():
+            yield None
+            return
+        store = SqliteSegmentStore(segments_dir)
+        with store.generation_lock():
+            segment_id = self._read_manifest_latest_segment_id(self._manifest_path(), log_missing=False)
+            index = self._select_search_index(store, segment_id)
+            if index is None or not index.db_path.is_file():
+                yield None
             else:
-                logger.debug("No search segments directory for %s", self.codename)
-            return None
+                with index.reader() as reader:
+                    yield reader
 
-        manifest_path = self._manifest_path()
-        if segment_id is None:
-            segment_id = self._read_manifest_latest_segment_id(manifest_path, log_missing=log_missing)
-        if not segment_id:
-            return None
-
-        search_db_path = search_segments_dir / f"{segment_id}.db"
-        if not search_db_path.exists():
-            if log_missing:
-                logger.warning("Search database not found: %s", search_db_path)
-            else:
-                logger.debug("Search database not found: %s", search_db_path)
-            return None
-
-        if not self._segment_ready(search_segments_dir, segment_id):
-            if log_missing:
-                logger.warning("Search segment not ready for %s: %s", self.codename, segment_id)
-            else:
-                logger.debug("Search segment not ready for %s: %s", self.codename, segment_id)
-            return None
-
-        try:
-            return SegmentSearchIndex(search_db_path, tenant=self.codename)
-        except Exception as exc:
-            logger.error("Failed to create search index for %s: %s", self.codename, exc)
-            return None
-
-    def _maybe_reload_from_manifest(self, *, log_missing: bool) -> bool:
-        manifest_path = self._manifest_path()
-        latest_segment_id = self._read_manifest_latest_segment_id(manifest_path, log_missing=log_missing)
-        if not latest_segment_id:
-            return False
-        if latest_segment_id == self._current_segment_id():
-            return False
-        new_index = self._create_search_index(segment_id=latest_segment_id, log_missing=log_missing)
-        if new_index is None:
-            return False
-        self._swap_search_index(new_index)
-        logger.info("[%s] Search index updated to segment %s", self.codename, latest_segment_id)
-        return True
+    def _select_search_index(self, store: SqliteSegmentStore, segment_id: str | None) -> SegmentSearchIndex | None:
+        current = self._search_index
+        if segment_id and (current is None or current.db_path.stem != segment_id):
+            segment = store.load(segment_id)
+            if segment is not None:
+                current = self._search_index = SegmentSearchIndex(
+                    segment.db_path, tenant=self.codename, segment=segment
+                )
+                logger.info("[%s] Search index updated to segment %s", self.codename, segment_id)
+        return current
 
     def _start_manifest_watch(self) -> None:
         if self._manifest_watch_task and not self._manifest_watch_task.done():
@@ -278,32 +182,22 @@ class TenantApp:
 
     async def _watch_manifest(self) -> None:
         while not self._manifest_stop_event.is_set():
-            self._maybe_reload_from_manifest(log_missing=False)
+            self.reload_search_index(log_missing=False)
             try:
                 await asyncio.wait_for(self._manifest_stop_event.wait(), timeout=self._manifest_poll_interval)
             except asyncio.TimeoutError:
                 continue
 
-    def reload_search_index(self) -> bool:
-        """Reload search index after sync/indexing completes.
-
-        Returns:
-            True if index was successfully loaded, False otherwise.
-        """
-        latest_segment_id = self._read_manifest_latest_segment_id(self._manifest_path(), log_missing=True)
-        if not latest_segment_id:
+    def reload_search_index(self, *, log_missing: bool = True) -> bool:
+        """Refresh validated segment metadata without keeping an open reader."""
+        segments_dir = self._segments_dir()
+        if not segments_dir.is_dir():
             return False
-
-        if latest_segment_id == self._current_segment_id():
-            logger.info("[%s] Search index already at latest segment %s", self.codename, latest_segment_id)
-            return True
-
-        new_index = self._create_search_index(segment_id=latest_segment_id, log_missing=True)
-        if new_index is None:
-            return False
-        self._swap_search_index(new_index)
-        logger.info("[%s] Search index reloaded successfully", self.codename)
-        return True
+        store = SqliteSegmentStore(segments_dir)
+        with store.generation_lock():
+            segment_id = self._read_manifest_latest_segment_id(self._manifest_path(), log_missing=log_missing)
+            index = self._select_search_index(store, segment_id)
+            return index is not None and index.db_path.stem == segment_id
 
     def _allow_index_builds(self) -> bool:
         if self.tenant_config.allow_index_builds is not None:
@@ -602,34 +496,25 @@ class TenantApp:
             "has_search_index": self._search_index is not None,
         }
 
-        with self._lease_search_index() as search_index:
-            if search_index:
-                # Get detailed performance info from search index
-                perf_info = search_index.get_performance_info()
-                stats.update(perf_info)
-
+        index = self._search_index
+        if index:
+            stats.update(index.get_performance_info())
         return stats
 
     def get_index_status(self) -> dict:
-        """Return index status summary for status endpoints."""
+        """Report the validated generation using cached metadata."""
+        index = self._search_index
+        current_segment_id = index.db_path.stem if index else None
         latest_segment_id = self._read_manifest_latest_segment_id(self._manifest_path(), log_missing=False)
-        current_segment_id = self._current_segment_id()
-        latest_segment = None
-        segments_dir = self._segments_dir()
-        if segments_dir.exists():
-            store = create_segment_store(segments_dir)
-            latest_segment = store.latest()
-        stats = {
-            "tenant": self.codename,
-            "has_search_index": self._search_index is not None,
+        segment = index.segment if index else None
+        return {
+            **self.get_performance_stats(),
             "current_segment_id": current_segment_id,
             "latest_segment_id": latest_segment_id,
-            "segment_ready": bool(latest_segment_id and self._segment_ready(self._segments_dir(), latest_segment_id)),
-            "doc_count": latest_segment.doc_count if latest_segment else 0,
-            "last_indexed_at": latest_segment.created_at.isoformat() if latest_segment else None,
+            "segment_ready": segment is not None and current_segment_id == latest_segment_id,
+            "doc_count": segment.doc_count if segment else 0,
+            "last_indexed_at": segment.created_at.isoformat() if segment else None,
         }
-        stats.update(self.get_performance_stats())
-        return stats
 
     async def health(self) -> dict:
         """Return health status."""

@@ -256,36 +256,18 @@ def cleanup_directory(
     if not directory.is_dir():
         return DirectoryReport(directory=directory, skipped_reason="not a directory")
 
-    # For SQLite storage, use the store to get segment information
     try:
         store = SqliteSegmentStore(directory)
         segments = store.list_segments()
-        
         if not segments:
             return DirectoryReport(directory=directory, skipped_reason="no segments found")
-        
-        # Keep only the most recent segments (up to MAX_SEGMENTS)
-        segments.sort(key=lambda s: s["created_at"], reverse=True)
-        keep_segments = segments[:SqliteSegmentStore.MAX_SEGMENTS]
-        keep_segment_ids = {s["segment_id"] for s in keep_segments}
-        
-        removed: list[RemovedFile] = []
-        errors: list[str] = []
-        
-        # Remove old segments
-        for db_file in directory.glob(f"*{SqliteSegmentStore.DB_SUFFIX}"):
-            segment_id = db_file.stem
-            if segment_id not in keep_segment_ids:
-                size = db_file.stat().st_size
-                removed.append(RemovedFile(path=db_file, size=size))
-                if not dry_run:
-                    try:
-                        db_file.unlink()
-                    except OSError as exc:
-                        errors.append(f"failed to remove {db_file.name}: {exc}")
-        
-        return DirectoryReport(directory=directory, removed=removed, errors=errors)
-        
+
+        segments.sort(key=lambda segment: segment["created_at"], reverse=True)
+        keep = (segment["segment_id"] for segment in segments[:SqliteSegmentStore.MAX_SEGMENTS])
+        removed, errors = store.prune_to_segment_ids(keep, dry_run=dry_run)
+        return DirectoryReport(
+            directory=directory, removed=[RemovedFile(path, size) for path, size in removed], errors=errors
+        )
     except Exception as exc:
         return DirectoryReport(directory=directory, errors=[f"cleanup error: {exc}"])
 

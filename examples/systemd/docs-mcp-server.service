@@ -1,0 +1,16 @@
+[Unit]
+Description=Local documentation MCP server
+StartLimitIntervalSec=0
+
+[Service]
+Type=exec
+LimitNOFILE=65536:524288
+WorkingDirectory=%h/src/docs-mcp-server
+Environment=DEPLOYMENT_CONFIG=%h/src/docs-mcp-server/deployment.json
+Environment=DOCS_MCP_BROWSER_SYSTEMD_UNIT=docs-mcp-browser.service
+ExecStart=%h/src/docs-mcp-server/.venv/bin/docs-mcp-server
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

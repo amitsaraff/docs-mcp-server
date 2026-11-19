@@ -52,12 +52,18 @@ class _PendingCommand:
 
 
 class CdpBrowserRuntime:
-    """Borrow one persistent Chrome while owning only per-fetch resources."""
+    """Share a CDP connection and optionally own the local Chrome lifecycle."""
 
-    def __init__(self, endpoint: str, capacity: int) -> None:
+    def __init__(
+        self, endpoint: str, capacity: int, *, systemd_unit: str | None = None, idle_seconds: float = 60
+    ) -> None:
         self._endpoint = endpoint.rstrip("/")
         self._endpoint_label = self._sanitize_endpoint(endpoint)
         self._capacity = capacity
+        self._systemd_unit = systemd_unit
+        self._unit_started = False
+        self._idle_seconds = idle_seconds
+        self._idle_task: asyncio.Task[None] | None = None
         self._semaphore = asyncio.Semaphore(capacity)
         self._state = "stopped"
         self._state_condition = asyncio.Condition()
@@ -80,14 +86,17 @@ class CdpBrowserRuntime:
         self._last_failure: str | None = None
 
     async def start(self) -> None:
-        """Connect to the externally owned browser and validate its protocol."""
+        """Prepare CDP and eagerly validate an external endpoint."""
         async with self._state_condition:
-            if self._state == "ready":
+            if self._state in {"idle", "ready"}:
                 return
             self._state = "starting"
         if self._http is None:
             timeout = aiohttp.ClientTimeout(total=10, connect=5, sock_connect=5)
             self._http = aiohttp.ClientSession(timeout=timeout)
+        if self._systemd_unit:
+            self._state = "idle"
+            return
         try:
             await self._ensure_connection()
         except Exception as exc:
@@ -119,15 +128,18 @@ class CdpBrowserRuntime:
         return True
 
     async def stop(self) -> None:
-        """Disconnect without closing the borrowed browser process."""
+        """Disconnect and stop Chrome when this runtime owns the service."""
         async with self._state_condition:
             self._state = "draining"
-        await self._close_connection()
-        if self._http is not None:
-            await self._http.close()
-            self._http = None
-        async with self._state_condition:
-            self._state = "stopped"
+            self._cancel_idle_stop()
+        async with self._connection_lock:
+            try:
+                await self._disconnect()
+            finally:
+                if self._http is not None:
+                    await self._http.close()
+                    self._http = None
+                self._state = "stopped"
 
     async def fetch(
         self,
@@ -162,6 +174,7 @@ class CdpBrowserRuntime:
             "endpoint": self._endpoint_label,
             "state": self._state,
             "ready": self._state == "ready" and self._connection_usable(),
+            "healthy": self._state == "idle" or (self._state == "ready" and self._connection_usable()),
             "active": self._active,
             "capacity": self._capacity,
             "acquired": self._acquired,
@@ -175,13 +188,14 @@ class CdpBrowserRuntime:
 
     async def _acquire(self) -> None:
         async with self._state_condition:
-            if self._state not in {"ready", "disconnected"}:
+            if self._state not in {"idle", "ready", "disconnected"}:
                 raise RuntimeError(f"Browser runtime does not accept leases while {self._state}")
         await self._semaphore.acquire()
         async with self._state_condition:
-            if self._state not in {"ready", "disconnected"}:
+            if self._state not in {"idle", "ready", "disconnected"}:
                 self._semaphore.release()
                 raise RuntimeError(f"Browser runtime does not accept leases while {self._state}")
+            self._cancel_idle_stop()
             self._active += 1
             self._acquired += 1
 
@@ -191,6 +205,53 @@ class CdpBrowserRuntime:
             self._released += 1
             self._semaphore.release()
             self._state_condition.notify_all()
+            if self._unit_started and not self._active and self._state in {"ready", "disconnected"}:
+                self._idle_task = asyncio.create_task(self._stop_when_idle(), name="cdp-browser-idle-stop")
+
+    def _cancel_idle_stop(self) -> None:
+        if self._idle_task is not None:
+            self._idle_task.cancel()
+            self._idle_task = None
+
+    async def _stop_when_idle(self) -> None:
+        await asyncio.sleep(self._idle_seconds)
+        async with self._connection_lock:
+            # Acquiring a lease cancels this task until the stop has begun.
+            self._idle_task = None
+            self._state = "idle"
+            try:
+                await self._disconnect()
+            except Exception as exc:
+                self._record_failure(exc)
+                if self._state == "idle":
+                    self._state = "disconnected"
+                logger.exception("Failed to stop idle Chrome")
+
+    async def _systemctl(self, action: str) -> None:
+        process = await asyncio.create_subprocess_exec(
+            "systemctl",
+            "--user",
+            action,
+            "--",
+            self._systemd_unit,
+        )
+        try:
+            status = await process.wait()
+        except asyncio.CancelledError:
+            if process.returncode is None:
+                process.kill()
+            await process.wait()
+            raise
+        if status:
+            raise RuntimeError(f"Could not {action} Chrome unit {self._systemd_unit} (exit {status})")
+
+    async def _disconnect(self) -> None:
+        try:
+            await self._close_connection()
+        finally:
+            if self._unit_started:
+                await self._systemctl("stop")
+                self._unit_started = False
 
     async def _ensure_connection(self) -> int:
         async with self._connection_lock:
@@ -199,30 +260,43 @@ class CdpBrowserRuntime:
             if self._http is None:
                 raise RuntimeError("Browser runtime has not been started")
 
-            if self._generation:
-                self._reconnects += 1
-            await self._close_connection()
-            websocket_url = await self._discover_with_retry()
-            websocket = await self._http.ws_connect(
-                websocket_url,
-                headers={"Host": "localhost"},
-                max_msg_size=16 * 1024 * 1024,
-            )
-            self._generation += 1
-            generation = self._generation
-            self._websocket = websocket
-            self._reader_task = asyncio.create_task(
-                self._read_messages(websocket, generation),
-                name=f"cdp-browser-reader-{generation}",
-            )
+            if self._state in {"draining", "stopped"}:
+                raise RuntimeError(f"Browser runtime cannot connect while {self._state}")
             try:
-                await self._probe_protocol(generation)
-            except BaseException:
-                await self._close_connection()
+                if self._systemd_unit and not self._unit_started:
+                    self._unit_started = True
+                    await self._systemctl("start")
+                generation = await self._connect()
+            except BaseException as exc:
+                self._record_failure(exc)
+                if self._state != "draining":
+                    self._state = "disconnected"
+                await self._disconnect()
                 raise
-            if self._state == "disconnected":
+            if self._state != "draining":
                 self._state = "ready"
+                self._last_failure = None
             return generation
+
+    async def _connect(self) -> int:
+        if self._generation:
+            self._reconnects += 1
+        await self._close_connection()
+        websocket_url = await self._discover_with_retry()
+        websocket = await self._http.ws_connect(
+            websocket_url,
+            headers={"Host": "localhost"},
+            max_msg_size=16 * 1024 * 1024,
+        )
+        self._generation += 1
+        generation = self._generation
+        self._websocket = websocket
+        self._reader_task = asyncio.create_task(
+            self._read_messages(websocket, generation),
+            name=f"cdp-browser-reader-{generation}",
+        )
+        await self._probe_protocol(generation)
+        return generation
 
     def _connection_usable(self) -> bool:
         return bool(
@@ -309,7 +383,7 @@ class CdpBrowserRuntime:
         except Exception as exc:  # pragma: no cover - aiohttp transport boundary
             failure = exc
         finally:
-            intentional_close = self._state in {"draining", "stopped"}
+            intentional_close = self._state in {"idle", "draining", "stopped"}
             if not intentional_close:
                 self._record_failure(failure)
             for command_id, pending in list(self._pending.items()):

@@ -41,7 +41,7 @@ def build_health_endpoint(
                 all_healthy = False
 
         browser = browser_runtime.snapshot() if browser_runtime else None
-        if browser is not None and not browser["ready"]:
+        if browser is not None and not browser.get("healthy", browser["ready"]):
             all_healthy = False
         overall_status = "healthy" if all_healthy else "degraded"
 
