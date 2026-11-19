@@ -1,10 +1,13 @@
 """Cache service for documentation with a filesystem backend."""
 
+from __future__ import annotations
+
 import asyncio
 from collections.abc import Callable
 from datetime import datetime, timezone
 import logging
 import math
+from typing import TYPE_CHECKING
 from urllib.parse import urlparse, urlsplit
 
 from opentelemetry.trace import SpanKind
@@ -16,8 +19,11 @@ from ..runtime.cdp_browser import BrowserRuntimeProtocol
 from ..service_layer import services
 from ..service_layer.filesystem_unit_of_work import AbstractUnitOfWork
 from ..services.semantic_cache_matcher import SemanticCacheMatcher
-from ..utils.doc_fetcher import AsyncDocFetcher, DocFetchError
 from ..utils.models import DocPage
+
+
+if TYPE_CHECKING:
+    from ..utils.doc_fetcher import AsyncDocFetcher, DocFetchError
 
 
 logger = logging.getLogger(__name__)
@@ -67,11 +73,15 @@ class CacheService:
     async def ensure_ready(self) -> None:
         """Ensure cache is ready (fetcher initialized)."""
         if self._fetcher is None:
-            self._fetcher = AsyncDocFetcher(
+            # Import the extraction stack only when an online fetch needs it.
+            from ..utils.doc_fetcher import AsyncDocFetcher  # noqa: PLC0415
+
+            fetcher = AsyncDocFetcher(
                 settings=self.settings,
                 browser_runtime=self._browser_runtime,
             )
-            await self._fetcher.__aenter__()
+            await fetcher.__aenter__()
+            self._fetcher = fetcher
             logger.info("Document fetcher initialized")
 
     async def close(self) -> None:
@@ -185,6 +195,8 @@ class CacheService:
         Returns:
             Tuple of (DocPage if successful, failure reason string when None)
         """
+        from ..utils.doc_fetcher import DocFetchError  # noqa: PLC0415
+
         if not self._fetcher:
             await self.ensure_ready()
 
@@ -389,7 +401,6 @@ class CacheService:
                     return semantic_hit, True, None
 
             # Fetch from source
-            await self.ensure_ready()
             logger.info("Fetching %s", url)
             span.add_event("fetch.start", {})
             page, failure_reason = await self.fetch_and_cache(url)

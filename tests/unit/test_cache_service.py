@@ -71,7 +71,7 @@ class TestCacheServiceInitialization:
     @pytest.mark.asyncio
     async def test_ensure_ready_initializes_fetcher(self, cache_service):
         """Test ensure_ready initializes the fetcher."""
-        with patch("docs_mcp_server.services.cache_service.AsyncDocFetcher") as mock_fetcher_class:
+        with patch("docs_mcp_server.utils.doc_fetcher.AsyncDocFetcher") as mock_fetcher_class:
             mock_fetcher = AsyncMock()
             mock_fetcher_class.return_value = mock_fetcher
 
@@ -84,7 +84,7 @@ class TestCacheServiceInitialization:
     async def test_close_cleans_up_resources(self, cache_service):
         """Test close properly cleans up resources."""
         # Initialize fetcher first
-        with patch("docs_mcp_server.services.cache_service.AsyncDocFetcher") as mock_fetcher_class:
+        with patch("docs_mcp_server.utils.doc_fetcher.AsyncDocFetcher") as mock_fetcher_class:
             mock_fetcher = AsyncMock()
             mock_fetcher_class.return_value = mock_fetcher
 
@@ -301,7 +301,7 @@ class TestFetchAndCache:
             ),
         )
 
-        with patch("docs_mcp_server.services.cache_service.AsyncDocFetcher") as mock_fetcher_class:
+        with patch("docs_mcp_server.utils.doc_fetcher.AsyncDocFetcher") as mock_fetcher_class:
             mock_fetcher = AsyncMock()
             mock_fetcher.fetch_page = AsyncMock(return_value=mock_page)
             mock_fetcher_class.return_value = mock_fetcher
@@ -329,7 +329,7 @@ class TestFetchAndCache:
     async def test_fetch_and_cache_failure(self, cache_service):
         """Test fetch failure marks document as failed."""
         # Mock fetcher to return None (failure)
-        with patch("docs_mcp_server.services.cache_service.AsyncDocFetcher") as mock_fetcher_class:
+        with patch("docs_mcp_server.utils.doc_fetcher.AsyncDocFetcher") as mock_fetcher_class:
             mock_fetcher = AsyncMock()
             mock_fetcher.fetch_page = AsyncMock(return_value=None)
             mock_fetcher_class.return_value = mock_fetcher
@@ -347,7 +347,7 @@ class TestFetchAndCache:
     async def test_fetch_and_cache_exception_handling(self, cache_service):
         """Test exception during fetch is handled gracefully."""
         # Mock fetcher to raise exception
-        with patch("docs_mcp_server.services.cache_service.AsyncDocFetcher") as mock_fetcher_class:
+        with patch("docs_mcp_server.utils.doc_fetcher.AsyncDocFetcher") as mock_fetcher_class:
             mock_fetcher = AsyncMock()
             mock_fetcher.fetch_page = AsyncMock(side_effect=Exception("Network error"))
             mock_fetcher_class.return_value = mock_fetcher
@@ -372,7 +372,7 @@ class TestFetchAndCache:
             readability_content=None,  # Simulates cascading extractor success without Readability
         )
 
-        with patch("docs_mcp_server.services.cache_service.AsyncDocFetcher") as mock_fetcher_class:
+        with patch("docs_mcp_server.utils.doc_fetcher.AsyncDocFetcher") as mock_fetcher_class:
             mock_fetcher = AsyncMock()
             mock_fetcher.fetch_page = AsyncMock(return_value=fallback_page)
             mock_fetcher_class.return_value = mock_fetcher
@@ -401,7 +401,7 @@ class TestFetchAndCache:
             readability_content=None,
         )
 
-        with patch("docs_mcp_server.services.cache_service.AsyncDocFetcher") as mock_fetcher_class:
+        with patch("docs_mcp_server.utils.doc_fetcher.AsyncDocFetcher") as mock_fetcher_class:
             mock_fetcher = AsyncMock()
             mock_fetcher.__aenter__ = AsyncMock(return_value=mock_fetcher)
             mock_fetcher.fetch_page = AsyncMock(return_value=lazy_page)
@@ -418,7 +418,7 @@ class TestFetchAndCache:
     @pytest.mark.asyncio
     async def test_fetch_and_cache_surfaces_fetch_error_reason(self, cache_service):
         """DocFetchError reasons should be bubbled up for telemetry."""
-        with patch("docs_mcp_server.services.cache_service.AsyncDocFetcher") as mock_fetcher_class:
+        with patch("docs_mcp_server.utils.doc_fetcher.AsyncDocFetcher") as mock_fetcher_class:
             mock_fetcher = AsyncMock()
             mock_fetcher.fetch_page = AsyncMock(side_effect=DocFetchError("fallback_extractor_failed", "status=500"))
             mock_fetcher_class.return_value = mock_fetcher
@@ -440,7 +440,7 @@ class TestFetchAndCache:
             readability_content=None,
         )
 
-        with patch("docs_mcp_server.services.cache_service.AsyncDocFetcher") as mock_fetcher_class:
+        with patch("docs_mcp_server.utils.doc_fetcher.AsyncDocFetcher") as mock_fetcher_class:
             mock_fetcher = AsyncMock()
             mock_fetcher.fetch_page = AsyncMock(return_value=failing_page)
             mock_fetcher_class.return_value = mock_fetcher
@@ -475,7 +475,7 @@ class TestCheckAndFetchPage:
             await uow.documents.add(doc)
             await uow.commit()
 
-        with patch("docs_mcp_server.services.cache_service.AsyncDocFetcher"):
+        with patch("docs_mcp_server.utils.doc_fetcher.AsyncDocFetcher"):
             await cache_service.ensure_ready()
 
             # Act
@@ -537,7 +537,7 @@ class TestCheckAndFetchPage:
             ),
         )
 
-        with patch("docs_mcp_server.services.cache_service.AsyncDocFetcher") as mock_fetcher_class:
+        with patch("docs_mcp_server.utils.doc_fetcher.AsyncDocFetcher") as mock_fetcher_class:
             mock_fetcher = AsyncMock()
             mock_fetcher.fetch_page = AsyncMock(return_value=mock_page)
             mock_fetcher_class.return_value = mock_fetcher

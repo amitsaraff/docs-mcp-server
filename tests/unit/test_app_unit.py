@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import subprocess
+import sys
 from types import TracebackType
 from typing import Any, Self
 
@@ -384,4 +386,46 @@ def _install_minimal_stubs(monkeypatch: pytest.MonkeyPatch, events: list[tuple[s
     monkeypatch.setattr(
         "docs_mcp_server.app_builder.CdpBrowserRuntime",
         lambda *_args, **_kwargs: FakeBrowserRuntime(events),
+    )
+
+
+@pytest.mark.unit
+def test_app_defers_extraction_dependencies_until_online_fetcher_initialization(
+    tmp_path: Path, standard_config: dict[str, Any]
+) -> None:
+    standard_config["tenants"][0]["docs_root_dir"] = str(tmp_path / "docs")
+    config_path = tmp_path / "deployment.json"
+    config_path.write_text(json.dumps(standard_config), encoding="utf-8")
+    subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            """
+import asyncio
+from pathlib import Path
+import sys
+
+from docs_mcp_server.app import create_app
+from docs_mcp_server.config import Settings
+from docs_mcp_server.services.cache_service import CacheService
+
+create_app(Path(sys.argv[1]))
+assert "article_extractor" not in sys.modules
+assert "pypdf" not in sys.modules
+
+async def initialize_fetcher():
+    cache = CacheService(Settings(), lambda: None)
+    await cache.ensure_ready()
+    try:
+        assert "article_extractor" in sys.modules
+        assert "pypdf" in sys.modules
+    finally:
+        await cache.close()
+
+asyncio.run(initialize_fetcher())
+""",
+            str(config_path),
+        ],
+        check=True,
+        timeout=15,
     )

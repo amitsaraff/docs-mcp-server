@@ -146,7 +146,7 @@ class TestCacheServiceOfflineMode:
             await uow.commit()
 
         # Mock fetcher that returns None (simulating fetch failure)
-        with patch("docs_mcp_server.services.cache_service.AsyncDocFetcher") as mock_fetcher_class:
+        with patch("docs_mcp_server.utils.doc_fetcher.AsyncDocFetcher") as mock_fetcher_class:
             mock_fetcher = AsyncMock()
             mock_fetcher.fetch_page = AsyncMock(return_value=None)
             mock_fetcher.__aenter__ = AsyncMock(return_value=mock_fetcher)
@@ -220,7 +220,7 @@ class TestCacheServiceOfflineMode:
             await uow.documents.add(doc)
             await uow.commit()
 
-        with patch("docs_mcp_server.services.cache_service.AsyncDocFetcher") as mock_fetcher_class:
+        with patch("docs_mcp_server.utils.doc_fetcher.AsyncDocFetcher") as mock_fetcher_class:
             mock_fetcher = AsyncMock()
             mock_fetcher.fetch_page = AsyncMock()
             mock_fetcher_class.return_value = mock_fetcher
